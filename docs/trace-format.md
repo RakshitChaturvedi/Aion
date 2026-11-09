@@ -1,0 +1,24 @@
+# QNX 8.0 Trace Format & Phase 1 Verification Report
+
+Prepared during Phase 1 Feasibility Spike using QNX SDP 8.0 on QEMU x86_64 (`procnto-smp-instr`).
+
+## 1. Phase 1 Verification Table
+
+| # | Question | Answer | Evidence from Captured Traces |
+| :--- | :--- | :--- | :--- |
+| **1** | How is tracing enabled on QNX 8.0, and is a special kernel needed? | Standard `mkqnximage --type=qemu` boots `/proc/boot/procnto-smp-instr` (instrumented microkernel) by default. Run `tracelogger -w -s <sec> -f <file.kev>` as root. | `inversion_spike_clean.txt`: `name:/proc/boot/procnto-smp-instr` (pid 1) and `TRACE_TRACELOGGER_ARGS:: tracelogger -w -s 3 -f /tmp/inversion_spike.kev`. |
+| **2** | Does `traceprinter` run on the host, or only on the target? | Runs natively on the Linux Pop!_OS host (`$QNX_HOST/usr/bin/traceprinter`). Note: Do **not** pass `-v` (which dumps raw `TRACEPARSER` debug lines); pass `-w` to `tracelogger` instead. | `TRACEPRINTER version 1.02` executed on Pop!_OS host producing `sample_001.txt` and `inversion_spike_clean.txt`. |
+| **3** | Does the text output contain thread names, priorities, thread states, CPU numbers? | **Yes, when captured with `tracelogger -w` (wide mode).** Every `THREAD` event prints `CPU:xx`, state, `pid`, `tid`, `priority`, and `policy` inline. Thread names are emitted in multi-line `PROCESS :PROCTHREAD_NAME` events. | `t:0x18cdadd3cf48 CPU:01 THREAD :THRUNNING pid:1404944 tid:4 priority:40 policy:1` and `PROCTHREAD_NAME pid:1404944 tid:4 name:sensor_high`. |
+| **4** | Does a mutex-blocked event identify the lock owner? | **Yes, in wide mode (`tracelogger -w`)!** When a mutex is contended, `KER_CALL :SYNC_MUTEX_LOCK/80` logs `sync_p` and `owner`. The lower 16 bits (`owner & 0xFFFF`) encode the owning `tid`. | `SYNC_MUTEX_LOCK/80 sync_p:0x000000501106c010 count:-1879048192 owner:1880096770` (`1880096770 & 0xFFFF == 2`, identifying `tid:2` `logger_low`). |
+| **5** | What are tracing overhead and file size for a capture? | A 2-to-3 second wide-mode capture on a 2-CPU system produces ~4,000–8,000 events (~400 KB `.kev` binary, ~1.5 MB text), parsed by Python in `< 0.15s`. | `sample_001.txt` (2s) and `inversion_spike_clean.txt` (3s, 4 buffer sequences of ~1010 events per CPU). |
+| **6** | Can Eclipse Trace Compass headless read the trace? | Not needed; custom Python parser (`src/timingguard/ingest.py`) parses `traceprinter` output directly in `< 0.15s` with zero external Java dependencies. | `python3 src/timingguard/ingest.py traces/inversion_spike_clean.txt` reconstructs full timelines directly. |
+| **7** | Do the exact state names (`THRUNNING`, `THREADY`, `THMUTEX`, `THSEM`, `THSEND`, `THREPLY`) appear as assumed? | **Yes.** Observed states: `THRUNNING`, `THREADY`, `THMUTEX`, `THSEM`, `THRECEIVE`, `THREPLY`, `THNANOSLEEP`, `THCONDVAR`, `THJOIN`, `THSIGWAITINFO`, `THINTR`, `THCREATE`, `THDESTROY`, `THDEAD`. | Verified across `sample_001.txt` and `inversion_spike_clean.txt`. |
+| **8** | Can user markers be inserted into the trace? | **Yes.** `TraceEvent(_NTO_TRACE_ADDCLASS, _NTO_TRACE_USER)` + `TraceEvent(_NTO_TRACE_INSERTUSRSTREVENT, id, str)` emits `USREVENT :EVENT:<id> STR:"..."`. Note: QNX 8.0 x86_64 swaps 32-bit word pairs in `USRSTREVENT` strings; integer events or pre-swapped/parsed strings work cleanly. | `t:0x18cdadd3e013 CPU:01 USREVENT :EVENT:101 STR:"tg_job_end:sesnro_high"`. |
+| **9** | Does the QNX image boot under KVM? | Yes, `/dev/kvm` is accessible on Pop!_OS host and `mkqnximage --type=qemu` runs dual-core x86_64 (`TRACE_CPU_NUM:: 2`, `2495955300` cycles/sec). | Header: `TRACE_CPU_NUM:: 2`, `TRACE_CYCLES_PER_SEC:: 2495955300`. |
+| **10** | Which events does the trace carry for CPU affinity, priority changes and interrupts? | CPU number is on every line (`CPU:00`, `CPU:01`). Affinity is set via `KER_CALL :THREAD_CTL/52`. Priority is logged on every `THREAD` transition in `-w` mode. Interrupts log `INTERRUPT :INT_DELIVER` and `THREAD :THINTR`. | Verified in `inversion_spike_clean.txt`. |
+
+## 2. Key Format Rules for `src/timingguard/ingest.py`
+1. **Always capture with `tracelogger -w` (wide mode):** Wide mode is essential because it appends `priority:<int> policy:<int>` to every `THREAD` state transition and includes `sync_p` + `owner` on `SYNC_MUTEX_LOCK/80`.
+2. **Do NOT pass `-v` to `traceprinter`:** Standard `traceprinter -f trace.kev` outputs clean chronological events.
+3. **Multi-line Event Continuation:** Events like `PROCCREATE_NAME`, `PROCTHREAD_NAME`, `SYNC_MUTEX_LOCK/80`, and `MSG_RECEIVEV/14` place their key-value fields (`pid:`, `tid:`, `name:`, `sync_p:`, `owner:`) on indented lines immediately following the `t:0x...` header line.
+4. **Fast-Path Mutex Note:** QNX 8.0 uses a user-space atomic fast-path for uncontended `pthread_mutex_lock()`. Kernel events (`SYNC_MUTEX_LOCK/80` and `THMUTEX`) are emitted **only when contention occurs**, which is the exact case needed for priority inversion detection.
