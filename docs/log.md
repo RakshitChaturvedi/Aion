@@ -38,3 +38,15 @@
   - Build the clean event model dataclasses (`src/timingguard/model.py`).
   - Implement the per-thread interval timeline builder and metrics engine (release, lateness, response time).
   - Implement the TOML config loader and the first deadline/priority inversion checker.
+
+## Tue Nov 10, 2026 (Phase 2: Core Engine — COMPLETED)
+- **What was done:**
+  - Built reusable Python SDK data model (`src/timingguard/model.py`) with navigable `CausalEdge` / `CausalFinding` RCA chains and `EvidenceRef` pointers (exact trace line numbers, hex cycle counts, millisecond timestamps, and confidence classes).
+  - Upgraded `src/timingguard/ingest.py` (`TraceSession`) to extract explicit marker-delimited jobs (`tg_job_begin` / `tg_job_end` via `samples/tg_markers.h`) and inferred timer jobs, plus per-job blocker attribution (`exec_ms`, `ready_preempted_ms`, `mutex_blocked_ms`, `sem_blocked_ms`, `ipc_blocked_ms`).
+  - Implemented TOML rule loader, global logical scheduling checks, wall-clock timing checks, and `compare_runs()` regression + causal attribution engine in `src/timingguard/analyzers.py`.
+  - Created first demo pair (`samples/inversion_demo.c` with `PTHREAD_PRIO_NONE` and `samples/inversion_fixed.c` with one-line `PTHREAD_PRIO_INHERIT`), captured single-core traces using `on -C 0` on QNX 8.0 (`traces/inversion_broken.txt` and `traces/inversion_fixed.txt`).
+- **What we got (Phase 2 Gate PASSED):**
+  - `aion check` on `traces/inversion_broken.txt` detects the 24.037 ms deadline miss and 23.032 ms mutex priority inversion (`sensor_high` -> `logger_low` -> preempted by `worker_med` on `CPU:00`) and exits `1`.
+  - `aion check` on `traces/inversion_fixed.txt` confirms `PTHREAD_PRIO_INHERIT` drops response time to 4.502 ms with 0 findings and exits `0`.
+  - `aion diff` detects the 5.34x (+19.535 ms) p99 regression and attributes it to `mutex:logger_low (+23.032 ms)`.
+  - All `pytest` unit and golden-file tests pass.

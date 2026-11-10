@@ -195,34 +195,36 @@ def _detect_mutex_priority_inversions(session: TraceSession, config: RuleConfig)
             )
             chain = [edge1]
 
-            # Hop 2: Find medium-priority threads (P_L < P_M < P_T) that ran while T was blocked
+            # Hop 2: Find medium-priority threads (P_L < P_M < P_T) that preempted L (while L was THREADY)
             preemptors: Dict[str, Tuple[ThreadTimeline, float, List[EvidenceRef]]] = {}
             for owner_iv in owner_th.intervals:
-                if owner_iv.state not in ("THREADY", "THRUNNING"):
+                if owner_iv.state != "THREADY":
                     continue
                 w_start = max(iv.start_ms, owner_iv.start_ms)
                 w_end = min(iv.end_ms, owner_iv.end_ms)
-                if w_end <= w_start:
+                if (w_end - w_start) <= 0.05:  # Ignore sub-50us context-switch edges
                     continue
 
-                # Check all CPUs where medium threads in the same process or system ran
                 for cpu_id in range(session.num_cpus):
                     for runner_th, run_iv in session.cpu_runner_at(cpu_id, w_start, w_end):
                         if (runner_th.pid, runner_th.tid) in ((th.pid, th.tid), (owner_th.pid, owner_th.tid)):
                             continue
                         if runner_th.pid == 1 and runner_th.tid in (1, 2):
                             continue  # Skip idle threads
-                        if owner_th.prio < run_iv.prio < iv.prio and (
-                            owner_iv.state == "THREADY" or runner_th.pid == th.pid
-                        ):
+                        if owner_iv.prio < run_iv.prio < iv.prio:
                             ov_s = max(w_start, run_iv.start_ms)
                             ov_e = min(w_end, run_iv.end_ms)
                             dur = ov_e - ov_s
                             key = runner_th.display_name
                             prev_th, prev_dur, prev_evs = preemptors.get(key, (runner_th, 0.0, []))
-                            if len(prev_evs) < 4:
-                                prev_evs.append(_iv_to_evidence(session, runner_th, run_iv, f"preempted {owner_th.name}"))
+                            cand_ev = _iv_to_evidence(session, runner_th, run_iv, f"preempted {owner_th.name}")
+                            if len(prev_evs) < 4 and all(e.line_no != cand_ev.line_no for e in prev_evs):
+                                prev_evs.append(cand_ev)
                             preemptors[key] = (prev_th, prev_dur + dur, prev_evs)
+
+            # A mutex block is a Priority Inversion ONLY if L was actually preempted by a medium thread M
+            if not preemptors:
+                continue
 
             for m_name, (m_th, m_dur, m_evs) in preemptors.items():
                 chain.append(

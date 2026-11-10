@@ -309,11 +309,11 @@ def _extract_jobs(session: TraceSession) -> None:
     # 1. Explicit marker-based extraction
     marker_begins: Dict[str, UserMarker] = {}
     for mk in session.markers:
-        if mk.payload.startswith("tg_job_begin:"):
-            tname = mk.payload.split(":")[1]
+        if mk.code == 100 or mk.payload.startswith("tg_job_begin:"):
+            tname = mk.payload.split(":")[-1].strip()
             marker_begins[tname] = mk
-        elif mk.payload.startswith("tg_job_end:"):
-            tname = mk.payload.split(":")[1]
+        elif mk.code == 101 or mk.payload.startswith("tg_job_end:"):
+            tname = mk.payload.split(":")[-1].strip()
             if tname in marker_begins:
                 b_mk = marker_begins.pop(tname)
                 for th in session.find_threads_by_name(tname):
