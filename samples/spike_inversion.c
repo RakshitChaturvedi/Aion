@@ -10,7 +10,7 @@ pthread_mutex_t lock;
 
 void pin_to_cpu0(void) {
     unsigned runmask = 0x1; //pin calling thread to cpu 0
-    ThreadCtl(_NTO_TCTL_RUNMASK, (void*)(uintptr_t)runmask);
+    ThreadCtl(_NTO_TCTL_RUNMASK, &runmask);
 }
 
 void burn_ms(int ms) {
@@ -24,13 +24,13 @@ void burn_ms(int ms) {
 }
 
 void* low_logger(void* arg) {
-    pin_to_cpu0()
+    pin_to_cpu0();
     pthread_setname_np(pthread_self(), "logger_low");
     TraceEvent(_NTO_TRACE_INSERTUSRSTREVENT, 10, "prio:10:logger_low_lock");
     pthread_mutex_lock(&lock);
     burn_ms(50); // hold lock for 50ms cpu time
     pthread_mutex_unlock(&lock);
-    TraceEvent(_NTO_TRACE_INSERTUSRSTREVENT, 11, "prio:10:logger_low_unlock")
+    TraceEvent(_NTO_TRACE_INSERTUSRSTREVENT, 11, "prio:10:logger_low_unlock");
     return NULL;
 }
 
