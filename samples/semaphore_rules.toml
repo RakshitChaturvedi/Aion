@@ -1,0 +1,13 @@
+[settings]
+target_env = "qemu"
+margin_pct = 10
+
+[logical_checks]
+priority_inversion = true
+semaphore_locks = true
+
+[[timing_rule]]
+name = "control_high deadline"
+thread = "control_high"
+deadline_ms = 10.0
+max_sched_latency_ms = 2.0

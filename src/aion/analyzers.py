@@ -1,7 +1,7 @@
 # casual rca Analyzers, toml config loader, and regression comparator.
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union, Sequence
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -47,6 +47,7 @@ class RuleConfig:
     trace: str = ""
     target_env: str = "qemu"
     margin_pct: float = 10.0
+    inconclusive_policy: str = "warn" # exit 4 warn or 1 fail
     scope_processes: List[str] = field(default_factory=list)
     priority_inversion: bool = True
     semaphore_locks: bool = True
@@ -89,10 +90,15 @@ def load_config(filepath: str) -> RuleConfig:
             )
         )
 
+    inc_policy=str(settings.get("inconclusive_policy", "warn")).lower()
+    if inc_policy not in ("warn", "fail"):
+        raise ConfigError("'inconclusive_policy' in [settings] must be 'warn' or 'fail'.")
+
     return RuleConfig(
         trace=str(settings.get("trace", "")),
         target_env=str(settings.get("target_env", "qemu")),
         margin_pct=float(settings.get("margin_pct", 10.0)),
+        inconclusive_policy=inc_policy,
         scope_processes=list(settings.get("scope_processes", [])),
         priority_inversion=bool(logical.get("priority_inversion", True)),
         semaphore_locks=bool(logical.get("semaphore_locks", True)),
@@ -102,7 +108,6 @@ def load_config(filepath: str) -> RuleConfig:
 
 
 def _is_target_workload_thread(th: ThreadTimeline, config: RuleConfig) -> bool:
-    """Returns True if `th` belongs to the user workload rather than a background QNX OS driver."""
     if th.pid == 1:
         return False
     if config.scope_processes:
@@ -134,6 +139,87 @@ def analyze_session(session: TraceSession, config: RuleConfig) -> List[CausalFin
 
     return sorted(findings, key=lambda f: f.start_ms)
 
+LOGICAL_FINDING_TYPES = {
+    FindingType.PRIORITY_INVERSION_MUTEX,
+    FindingType.PRIORITY_INVERSION_SEM,
+    FindingType.PRIORITY_INVERSION_IPC,
+    FindingType.FORBIDDEN_BLOCKING_IPC
+}
+
+WALL_CLOCK_FINDING_TYPES = {
+    FindingType.DEADLINE_MISS,
+    FindingType.LATENESS_MISS,
+    FindingType.SCHED_LATENCY_MISS,
+    FindingType.CPU_HOG
+}
+
+@dataclass
+class VerdictSummary:
+    # 3 verdict classification -- logical, wall-clock, inconclusive.
+    overall_verdict: str        # pass, fail or inconclusive
+    logical_verdict: str        # pass or fail
+    wall_clock_verdict: str     # pass, fail or inconclusive
+    inconclusive_reasons: List[str] = field(default_factory=list)
+    exit_code: int = 0          # 0 = pass, 1 = fail, 4 = inconclusive
+
+def evaluate_verdicts(session:TraceSession, config:RuleConfig, findings:List[CausalFinding]) -> VerdictSummary:
+    logical_fails = [f for f in findings if f.finding_type in LOGICAL_FINDING_TYPES]
+    wall_fails = [f for f in findings if f.finding_type in WALL_CLOCK_FINDING_TYPES]
+    inc_reasons: List[str] = []
+
+    # 1. target timing rule thread missing or had 0 completed jobs in trace
+    for rule in config.timing_rules:
+        matched = session.find_threads_by_name(rule.thread)
+        if not matched:
+            inc_reasons.append(f"Rule '{rule.name}': target thread '{rule.thread}' not found in trace.")
+        elif not any(th.jobs for th in matched) and not any(th.intervals for th in matched):
+            inc_reasons.append(f"Rule '{rule.name}': thread '{rule.thread}' had 0 state intervals.")
+        elif rule.deadline_ms is not None and not any(th.jobs for th in matched):
+            inc_reasons.append(f"Rule '{rule.name}': thread '{rule.thread}' had 0 completed jobs for deadline check.")
+
+    # 2. excessive malformed trace lines
+    if session.malformed_lines > 50:
+        inc_reasons.appnd(f"Trace contained {session.malformed_lines} malformed lines (>50 threshold).")
+    logical_v = "FAIL" if logical_fails else "PASS"
+    if wall_fails:
+        wall_v = "FAIL"
+    elif inc_reasons:
+        wall_v = "INCONCLUSIVE"
+    else:
+        wall_v = "PASS"
+
+    if logical_fails or wall_fails:
+        return VerdictSummary(
+            overall_verdict="FAIL",
+            logical_verdict=logical_v,
+            wall_clock_verdict=wall_v,
+            inconclusive_reasons=inc_reasons,
+            exit_code=1
+        )
+    if inc_reasons:
+        if config.inconclusive_policy == "fail":
+            return VerdictSummary(
+                overall_verdict="FAIL",
+                logical_verdict=logical_v,
+                wall_clock_verdict="INCONCLUSIVE",
+                inconclusive_reasons=inc_reasons,
+                exit_code=1
+            )
+        return VerdictSummary(
+            overall_verdict="INCONCLUSIVE",
+            logical_verdict=logical_v,
+            wall_clock_verdict="INCONCLUSIVE",
+            inconclusive_reasons=inc_reasons,
+            exit_code=4
+        )
+    return VerdictSummary(
+        overall_verdict="PASS",
+        logical_verdict="PASS",
+        wall_clock_verdict="PASS",
+        inconclusive_reasons=[],
+        exit_code=0
+    )
+    
 
 def _iv_to_evidence(session: TraceSession, th: ThreadTimeline, iv: StateInterval, extra: str = "") -> EvidenceRef:
     details = f"pid:{th.pid} tid:{th.tid} ({th.name or 'main'}) prio:{iv.prio}"
@@ -150,13 +236,46 @@ def _iv_to_evidence(session: TraceSession, th: ThreadTimeline, iv: StateInterval
     )
 
 
+def _find_medium_preemptors(
+    session: TraceSession,
+    waiter_th: ThreadTimeline,
+    waiter_prio: int,
+    owner_th: ThreadTimeline,
+    window_start_ms: float,
+    window_end_ms: float,
+) -> Dict[str, Tuple[ThreadTimeline, int, float, List[EvidenceRef]]]:
+    """Finds all medium-priority threads (owner_prio < prio < waiter_prio) that preempted `owner_th` while it was THREADY."""
+    preemptors: Dict[str, Tuple[ThreadTimeline, int, float, List[EvidenceRef]]] = {}
+    for owner_iv in owner_th.intervals:
+        if owner_iv.state != "THREADY":
+            continue
+
+        w_start = max(window_start_ms, owner_iv.start_ms)
+        w_end = min(window_end_ms, owner_iv.end_ms)
+        if (w_end - w_start) <= 0.05:
+            continue
+
+        for cpu_id in range(session.num_cpus):
+            for runner_th, run_iv in session.cpu_runner_at(cpu_id, w_start, w_end):
+                if (runner_th.pid, runner_th.tid) in ((waiter_th.pid, waiter_th.tid), (owner_th.pid, owner_th.tid)):
+                    continue
+                if runner_th.pid == 1 and runner_th.tid in (1,2):
+                    continue
+                if owner_iv.prio < run_iv.prio < waiter_prio:
+                    ov_s = max(w_start, run_iv.start_ms)
+                    ov_e = min(w_end, run_iv.end_ms)
+                    dur = ov_e - ov_s
+
+                    key = runner_th.display_name_at(run_iv.prio)
+                    prev_th, prev_prio, prev_dur, prev_evs = preemptors.get(key, (runner_th, run_iv.prio, 0.0, []))
+                    cand_ev = _iv_to_evidence(session, runner_th, run_iv, f"preempted {owner_th.name}")
+                    if len(prev_evs) < 4 and all(e.line_no != cand_ev.line_no for e in prev_evs):
+                        prev_evs.append(cand_ev)
+                    preemptors[key] = (prev_th, max(prev_prio, run_iv.prio), prev_dur + dur, prev_evs)
+    return dict(sorted(preemptors.items(), key=lambda kv: kv[1][2], reverse=True))
+
+
 def _detect_mutex_priority_inversions(session: TraceSession, config: RuleConfig) -> List[CausalFinding]:
-    """
-    Scans for Mutex Priority Inversion on target workload threads:
-    1. Victim thread T (prio P_T) is in THMUTEX waiting on mutex held by Owner L (prio P_L < P_T).
-    2. While T is blocked, checks which medium-priority threads M (P_L < P_M < P_T) preempted L
-       on L's CPU or ran in place of L.
-    """
     findings: List[CausalFinding] = []
     for th in session.threads.values():
         if not _is_target_workload_thread(th, config):
@@ -181,7 +300,12 @@ def _detect_mutex_priority_inversions(session: TraceSession, config: RuleConfig)
             if not owner_th or owner_th.prio >= iv.prio:
                 continue
 
-            # Hop 1: Victim T -> Blocked on Mutex held by Owner L
+            preemptors = _find_medium_preemptors(
+                session, th, iv.prio, owner_th, iv.start_ms, iv.end_ms
+            )
+            if not preemptors:
+                continue
+
             edge1 = CausalEdge(
                 relation="BLOCKED_ON_MUTEX",
                 victim_thread=th.display_name,
@@ -195,44 +319,13 @@ def _detect_mutex_priority_inversions(session: TraceSession, config: RuleConfig)
             )
             chain = [edge1]
 
-            # Hop 2: Find medium-priority threads (P_L < P_M < P_T) that preempted L (while L was THREADY)
-            preemptors: Dict[str, Tuple[ThreadTimeline, float, List[EvidenceRef]]] = {}
-            for owner_iv in owner_th.intervals:
-                if owner_iv.state != "THREADY":
-                    continue
-                w_start = max(iv.start_ms, owner_iv.start_ms)
-                w_end = min(iv.end_ms, owner_iv.end_ms)
-                if (w_end - w_start) <= 0.05:  # Ignore sub-50us context-switch edges
-                    continue
-
-                for cpu_id in range(session.num_cpus):
-                    for runner_th, run_iv in session.cpu_runner_at(cpu_id, w_start, w_end):
-                        if (runner_th.pid, runner_th.tid) in ((th.pid, th.tid), (owner_th.pid, owner_th.tid)):
-                            continue
-                        if runner_th.pid == 1 and runner_th.tid in (1, 2):
-                            continue  # Skip idle threads
-                        if owner_iv.prio < run_iv.prio < iv.prio:
-                            ov_s = max(w_start, run_iv.start_ms)
-                            ov_e = min(w_end, run_iv.end_ms)
-                            dur = ov_e - ov_s
-                            key = runner_th.display_name
-                            prev_th, prev_dur, prev_evs = preemptors.get(key, (runner_th, 0.0, []))
-                            cand_ev = _iv_to_evidence(session, runner_th, run_iv, f"preempted {owner_th.name}")
-                            if len(prev_evs) < 4 and all(e.line_no != cand_ev.line_no for e in prev_evs):
-                                prev_evs.append(cand_ev)
-                            preemptors[key] = (prev_th, prev_dur + dur, prev_evs)
-
-            # A mutex block is a Priority Inversion ONLY if L was actually preempted by a medium thread M
-            if not preemptors:
-                continue
-
-            for m_name, (m_th, m_dur, m_evs) in preemptors.items():
+            for m_name, (m_th, m_prio, m_dur, m_evs) in preemptors.items():
                 chain.append(
                     CausalEdge(
                         relation="PREEMPTED_BY_MEDIUM_THREAD",
                         victim_thread=owner_th.display_name,
                         culprit_thread=m_name,
-                        mechanism=f"strict priority preemption (prio {m_th.prio} > prio {owner_th.prio})",
+                        mechanism=f"strict priority preemption (prio {m_prio} > prio {owner_th.prio})",
                         duration_ms=m_dur,
                         start_ms=iv.start_ms,
                         end_ms=iv.end_ms,
@@ -241,11 +334,7 @@ def _detect_mutex_priority_inversions(session: TraceSession, config: RuleConfig)
                     )
                 )
 
-            preempt_desc = (
-                f" while {', '.join(preemptors.keys())} ran at medium priority"
-                if preemptors
-                else " (uninherited mutex lock)"
-            )
+            preempt_desc = f" while {', '.join(preemptors.keys())} ran at medium priority"
             findings.append(
                 CausalFinding(
                     finding_type=FindingType.PRIORITY_INVERSION_MUTEX,
@@ -271,7 +360,6 @@ def _detect_mutex_priority_inversions(session: TraceSession, config: RuleConfig)
 
 
 def _detect_forbidden_blocking_ipc(session: TraceSession, thread_names: List[str]) -> List[CausalFinding]:
-    """Detects when a critical real-time thread enters THSEND or THREPLY (excluding internal procnto TraceEvent calls)."""
     findings: List[CausalFinding] = []
     for tname in thread_names:
         for th in session.find_threads_by_name(tname):
@@ -279,7 +367,6 @@ def _detect_forbidden_blocking_ipc(session: TraceSession, thread_names: List[str
                 if iv.state not in ("THREPLY", "THSEND"):
                     continue
                 srv_pid = iv.ipc_server_pid or 0
-                # Ignore microsecond kernel calls to procnto (pid 1) unless they block > 0.5 ms
                 if srv_pid == 1 and iv.duration_ms < 0.5:
                     continue
                 srv_name = session.processes.get(srv_pid, f"pid:{srv_pid}")
@@ -319,100 +406,196 @@ def _detect_forbidden_blocking_ipc(session: TraceSession, thread_names: List[str
 
 
 def _detect_ipc_channel_inversions(session: TraceSession, config: RuleConfig) -> List[CausalFinding]:
-    """Detects when a high-priority workload client blocks in THREPLY on a user/system server running at lower priority."""
+    """
+    Detects IPC Channel Priority Inversion:
+    Client T (prio P_T) blocks in THREPLY waiting on Server S, while S runs or sits THREADY
+    at lower priority P_S < P_T (because _NTO_CHF_FIXED_PRIORITY disabled priority inheritance),
+    AND traces any medium-priority thread M (P_S < P_M < P_T) that preempted S!
+    """
     findings: List[CausalFinding] = []
     for th in session.threads.values():
         if not _is_target_workload_thread(th, config) or th.prio < 25:
             continue
         if th.tid == 1 and not th.name:
-            continue  # Skip main() thread setup IPC
+            continue
         for iv in th.intervals:
             if iv.state != "THREPLY" or not iv.ipc_server_pid or iv.ipc_server_pid == 1:
                 continue
-            srv_threads = [
-                st for (p, _), st in session.threads.items() if p == iv.ipc_server_pid and st.prio > 0
-            ]
-            for st in srv_threads:
+            if iv.duration_ms < 0.2:
+                continue
+
+            if iv.ipc_server_tid and (iv.ipc_server_pid, iv.ipc_server_tid) in session.threads:
+                srv_candidates = [session.threads[(iv.ipc_server_pid, iv.ipc_server_tid)]]
+            else:
+                srv_candidates = [
+                    st for (p, _), st in session.threads.items()
+                    if p == iv.ipc_server_pid and st.prio > 0 and (p, st.tid) != (th.pid, th.tid)
+                ]
+
+            for st in srv_candidates:
+                matched_s_iv = None
                 for s_iv in st.intervals:
                     ov_s = max(iv.start_ms, s_iv.start_ms)
                     ov_e = min(iv.end_ms, s_iv.end_ms)
-                    if ov_e > ov_s and 0 < s_iv.prio < iv.prio and s_iv.state in ("THREADY", "THRUNNING"):
-                        edge = CausalEdge(
-                            relation="IPC_CHANNEL_PRIORITY_DROP",
-                            victim_thread=th.display_name,
-                            culprit_thread=st.display_name,
-                            mechanism=f"THREPLY wait on server running at prio {s_iv.prio} (< client prio {iv.prio})",
-                            duration_ms=ov_e - ov_s,
-                            start_ms=ov_s,
-                            end_ms=ov_e,
-                            confidence=Confidence.CONFIRMED,
-                            evidence=[
-                                _iv_to_evidence(session, th, iv, "client THREPLY"),
-                                _iv_to_evidence(session, st, s_iv, f"server prio {s_iv.prio}"),
-                            ],
-                        )
-                        findings.append(
-                            CausalFinding(
-                                finding_type=FindingType.PRIORITY_INVERSION_IPC,
-                                severity="FAIL",
-                                rule_name="logical_checks.priority_inversion",
-                                victim_thread=th.display_name,
-                                summary=(
-                                    f"{th.display_name} blocked in THREPLY while server {st.display_name} "
-                                    f"executed at uninherited priority {s_iv.prio}."
-                                ),
-                                suggested_fix=(
-                                    "Ensure channel does not set _NTO_CHF_FIXED_PRIORITY, or decouple "
-                                    "the real-time client using non-blocking pulses (MsgSendPulse)."
-                                ),
-                                confidence=Confidence.CONFIRMED,
-                                start_ms=iv.start_ms,
-                                end_ms=iv.end_ms,
-                                duration_ms=iv.duration_ms,
-                                causal_chain=[edge],
-                            )
-                        )
+                    if (ov_e - ov_s) > 0.1 and 0 < s_iv.prio < iv.prio and s_iv.state in ("THREADY", "THRUNNING"):
+                        matched_s_iv = s_iv
                         break
+
+                if not matched_s_iv:
+                    continue
+
+                edge1 = CausalEdge(
+                    relation="IPC_CHANNEL_PRIORITY_DROP",
+                    victim_thread=th.display_name,
+                    culprit_thread=st.display_name,
+                    mechanism=f"THREPLY wait on server at prio {matched_s_iv.prio} (< client prio {iv.prio})",
+                    duration_ms=iv.duration_ms,
+                    start_ms=iv.start_ms,
+                    end_ms=iv.end_ms,
+                    confidence=Confidence.CONFIRMED,
+                    evidence=[
+                        _iv_to_evidence(session, th, iv, "client THREPLY"),
+                        _iv_to_evidence(session, st, matched_s_iv, f"server prio {matched_s_iv.prio}"),
+                    ],
+                )
+                chain = [edge1]
+
+                preemptors = _find_medium_preemptors(
+                    session, th, iv.prio, st, iv.start_ms, iv.end_ms
+                )
+                for m_name, (m_th, m_prio, m_dur, m_evs) in preemptors.items():
+                    chain.append(
+                        CausalEdge(
+                            relation="PREEMPTED_BY_MEDIUM_THREAD",
+                            victim_thread=st.display_name,
+                            culprit_thread=m_name,
+                            mechanism=f"strict priority preemption (prio {m_prio} > server prio {matched_s_iv.prio})",
+                            duration_ms=m_dur,
+                            start_ms=iv.start_ms,
+                            end_ms=iv.end_ms,
+                            confidence=Confidence.CONFIRMED,
+                            evidence=m_evs,
+                        )
+                    )
+
+                preempt_desc = (
+                    f" and was preempted by {', '.join(preemptors.keys())}"
+                    if preemptors
+                    else ""
+                )
+                findings.append(
+                    CausalFinding(
+                        finding_type=FindingType.PRIORITY_INVERSION_IPC,
+                        severity="FAIL",
+                        rule_name="logical_checks.priority_inversion",
+                        victim_thread=th.display_name,
+                        summary=(
+                            f"{th.display_name} blocked in THREPLY for {iv.duration_ms:.3f} ms while server "
+                            f"{st.display_name} executed at uninherited priority {matched_s_iv.prio}{preempt_desc}."
+                        ),
+                        suggested_fix=(
+                            "Remove _NTO_CHF_FIXED_PRIORITY from ChannelCreate() so the server inherits "
+                            "client priority, or decouple with non-blocking MsgSendPulse()."
+                        ),
+                        confidence=Confidence.CONFIRMED,
+                        start_ms=iv.start_ms,
+                        end_ms=iv.end_ms,
+                        duration_ms=iv.duration_ms,
+                        causal_chain=chain,
+                    )
+                )
+                break
     return findings
 
 
 def _detect_semaphore_inversions(session: TraceSession, config: RuleConfig) -> List[CausalFinding]:
-    """Flags high-priority target workload threads blocking on semaphores."""
+    """
+    Task 3: Separate legitimate semaphore signalling (where poster prio >= waiter prio, no finding)
+    from lock-like / inverted semaphore waits (where high-priority waiter blocks in THSEM
+    waiting for a lower-priority poster, with multi-hop medium-thread preemption attribution).
+    """
     findings: List[CausalFinding] = []
     for th in session.threads.values():
         if not _is_target_workload_thread(th, config) or th.prio < 25:
             continue
         for iv in th.intervals:
-            if iv.state == "THSEM" and iv.duration_ms > 0.1:
-                edge = CausalEdge(
-                    relation="BLOCKED_ON_SEMAPHORE",
+            if iv.state != "THSEM" or iv.duration_ms <= 0.5:
+                continue
+
+            poster_th: Optional[ThreadTimeline] = None
+            confidence = Confidence.CONFIRMED
+            if iv.owner_key and iv.owner_key in session.threads:
+                poster_th = session.threads[iv.owner_key]
+            else:
+                candidates = [
+                    other for (p, t), other in session.threads.items()
+                    if p == th.pid and t != th.tid and other.prio < iv.prio
+                ]
+                if candidates:
+                    poster_th = min(candidates, key=lambda c: c.prio)
+                    confidence = Confidence.INFERRED
+
+            # If a higher-or-equal priority thread posted the semaphore, that's legitimate signalling!
+            if not poster_th or poster_th.prio >= iv.prio:
+                continue
+
+            culprit_label = poster_th.display_name
+            edge1 = CausalEdge(
+                relation="BLOCKED_ON_SEMAPHORE",
+                victim_thread=th.display_name,
+                culprit_thread=culprit_label,
+                mechanism=f"semaphore {iv.sync_p or 'unknown'} (QNX semaphores have no priority inheritance)",
+                duration_ms=iv.duration_ms,
+                start_ms=iv.start_ms,
+                end_ms=iv.end_ms,
+                confidence=confidence,
+                evidence=[_iv_to_evidence(session, th, iv, f"sync_p={iv.sync_p}")],
+            )
+            chain = [edge1]
+
+            preemptors = {}
+            if poster_th:
+                preemptors = _find_medium_preemptors(
+                    session, th, iv.prio, poster_th, iv.start_ms, iv.end_ms
+                )
+                for m_name, (m_th, m_prio, m_dur, m_evs) in preemptors.items():
+                    chain.append(
+                        CausalEdge(
+                            relation="PREEMPTED_BY_MEDIUM_THREAD",
+                            victim_thread=poster_th.display_name,
+                            culprit_thread=m_name,
+                            mechanism=f"strict priority preemption (prio {m_prio} > poster prio {poster_th.prio})",
+                            duration_ms=m_dur,
+                            start_ms=iv.start_ms,
+                            end_ms=iv.end_ms,
+                            confidence=confidence,
+                            evidence=m_evs,
+                        )
+                    )
+
+            preempt_desc = (
+                f" while {', '.join(preemptors.keys())} preempted {poster_th.name}"
+                if preemptors and poster_th
+                else ""
+            )
+            findings.append(
+                CausalFinding(
+                    finding_type=FindingType.PRIORITY_INVERSION_SEM,
+                    severity="FAIL",
+                    rule_name="logical_checks.semaphore_locks",
                     victim_thread=th.display_name,
-                    culprit_thread=f"semaphore {iv.sync_p or 'unknown'}",
-                    mechanism="QNX semaphores (THSEM) do not support priority inheritance",
-                    duration_ms=iv.duration_ms,
+                    summary=(
+                        f"Real-time thread {th.display_name} blocked in THSEM on {iv.sync_p} "
+                        f"for {iv.duration_ms:.3f} ms waiting on lower-priority {culprit_label}{preempt_desc}."
+                    ),
+                    suggested_fix="Replace shared-resource semaphore with a pthread_mutex_t configured with PTHREAD_PRIO_INHERIT.",
+                    confidence=confidence,
                     start_ms=iv.start_ms,
                     end_ms=iv.end_ms,
-                    confidence=Confidence.CONFIRMED,
-                    evidence=[_iv_to_evidence(session, th, iv, f"sync_p={iv.sync_p}")],
+                    duration_ms=iv.duration_ms,
+                    causal_chain=chain,
                 )
-                findings.append(
-                    CausalFinding(
-                        finding_type=FindingType.PRIORITY_INVERSION_SEM,
-                        severity="FAIL",
-                        rule_name="logical_checks.semaphore_locks",
-                        victim_thread=th.display_name,
-                        summary=(
-                            f"Real-time thread {th.display_name} blocked on semaphore {iv.sync_p} "
-                            f"for {iv.duration_ms:.3f} ms."
-                        ),
-                        suggested_fix="Replace lock semaphore with a pthread_mutex_t configured with PTHREAD_PRIO_INHERIT.",
-                        confidence=Confidence.CONFIRMED,
-                        start_ms=iv.start_ms,
-                        end_ms=iv.end_ms,
-                        duration_ms=iv.duration_ms,
-                        causal_chain=[edge],
-                    )
-                )
+            )
     return findings
 
 
@@ -424,22 +607,32 @@ def _check_timing_rule(session: TraceSession, rule: TimingRule, margin_mult: flo
             limit = rule.max_sched_latency_ms * margin_mult
             for iv in th.intervals:
                 if iv.state == "THREADY" and iv.duration_ms > limit:
-                    edges = []
+                    hog_groups: Dict[str, Tuple[int, float, List[EvidenceRef]]] = {}
                     for runner_th, run_iv in session.cpu_runner_at(iv.cpu, iv.start_ms, iv.end_ms):
+                        if runner_th.pid == 1 and runner_th.tid in (1, 2):
+                            continue
                         ov = min(iv.end_ms, run_iv.end_ms) - max(iv.start_ms, run_iv.start_ms)
-                        edges.append(
-                            CausalEdge(
-                                relation="CPU_OCCUPIED_BY",
-                                victim_thread=th.display_name,
-                                culprit_thread=runner_th.display_name,
-                                mechanism=f"CPU:{iv.cpu:02d} preemption/interference",
-                                duration_ms=ov,
-                                start_ms=max(iv.start_ms, run_iv.start_ms),
-                                end_ms=min(iv.end_ms, run_iv.end_ms),
-                                confidence=Confidence.CONFIRMED,
-                                evidence=[_iv_to_evidence(session, runner_th, run_iv)],
-                            )
+                        key = runner_th.display_name_at(run_iv.prio)
+                        prev_prio, prev_dur, prev_evs = hog_groups.get(key, (run_iv.prio, 0.0, []))
+                        cand_ev = _iv_to_evidence(session, runner_th, run_iv)
+                        if len(prev_evs) < 4 and all(e.line_no != cand_ev.line_no for e in prev_evs):
+                            prev_evs.append(cand_ev)
+                        hog_groups[key] = (max(prev_prio, run_iv.prio), prev_dur + ov, prev_evs)
+
+                    edges = [
+                        CausalEdge(
+                            relation="CPU_OCCUPIED_BY",
+                            victim_thread=th.display_name,
+                            culprit_thread=culprit_label,
+                            mechanism=f"CPU:{iv.cpu:02d} interference (hog prio {h_prio} vs victim prio {iv.prio})",
+                            duration_ms=h_dur,
+                            start_ms=iv.start_ms,
+                            end_ms=iv.end_ms,
+                            confidence=Confidence.CONFIRMED,
+                            evidence=h_evs,
                         )
+                        for culprit_label, (h_prio, h_dur, h_evs) in hog_groups.items()
+                    ]
                     findings.append(
                         CausalFinding(
                             finding_type=FindingType.SCHED_LATENCY_MISS,
@@ -450,7 +643,7 @@ def _check_timing_rule(session: TraceSession, rule: TimingRule, margin_mult: flo
                                 f"{th.display_name} spent {iv.duration_ms:.3f} ms in THREADY "
                                 f"(limit: {limit:.3f} ms including margin)."
                             ),
-                            suggested_fix="Lower CPU hog priority/workload or isolate critical thread core affinity.",
+                            suggested_fix="Lower CPU hog priority below critical thread or isolate core affinity (ThreadCtl/on -C).",
                             confidence=Confidence.CONFIRMED,
                             start_ms=iv.start_ms,
                             end_ms=iv.end_ms,
@@ -466,7 +659,7 @@ def _check_timing_rule(session: TraceSession, rule: TimingRule, margin_mult: flo
                     top_culprit = (
                         max(job.blocker_attribution.items(), key=lambda kv: kv[1])
                         if job.blocker_attribution
-                        else ("CPU preemption / execution", job.ready_preempted_ms + job.exec_ms)
+                        else ("CPU execution", job.exec_ms)
                     )
                     findings.append(
                         CausalFinding(
@@ -479,14 +672,108 @@ def _check_timing_rule(session: TraceSession, rule: TimingRule, margin_mult: flo
                                 f"(deadline: {limit:.3f} ms). Primary delay source: {top_culprit[0]} "
                                 f"({top_culprit[1]:.3f} ms)."
                             ),
-                            suggested_fix="Inspect causal blockers (mutex inversion, IPC wait, or CPU interference) during this job window.",
+                            suggested_fix="Inspect causal blockers (mutex/semaphore inversion, IPC wait, or CPU hog) during this job window.",
                             confidence=Confidence.INFERRED if job.inferred else Confidence.CONFIRMED,
                             start_ms=job.release_ms,
                             end_ms=job.completion_ms,
                             duration_ms=job.response_time_ms,
                         )
                     )
+
+        if rule.max_lateness_ms is not None:
+            limit = rule.max_lateness_ms*margin_mult
+            for job in th.jobs:
+                if job.start_lateness_ms > limit:
+                    preempt_causes = {
+                        k:v for k, v in job.blocker_attribution.items() if k.startswith("cpu_preempt:")
+                    }
+                    top_culprit = (
+                        max(preempt_causes.items(), key=lambda kv: kv[1])
+                        if preempt_causes else ("THREADY dispatch delay", job.start_lateness_ms)
+                    )
+                    findings.append(
+                        CausalFinding(
+                            finding_type=FindingType.LATENESS_MISS,
+                            severity="FAIL",
+                            rule_name=rule.name,
+                            victim_thread=th.display_name,
+                            summary=(
+                                f"Job #{job.job_index} of {th.display_name} started {job.start_lateness_ms:.3f} ms "
+                                f"after release (lateness limit: {limit:.3f} ms). Primary delay source: "
+                                f"{top_culprit[0]} ({top_culprit[1]:.3f} ms)."
+                            ),
+                            suggested_fix="Raise thread priority above interfering runnable threads or pin to an isolated CPU core.",
+                            confidence=Confidence.INFERRED if job.inferred else Confidence.CONFIRMED,
+                            start_ms=job.release_ms,
+                            end_ms=job.start_running_ms,
+                            duration_ms=job.start_lateness_ms,
+                        )
+                    )
     return findings
+
+
+@dataclass
+class RunProfile:
+    """Task 10: Summarizes one or more TraceSessions into a statistical + causal attribution profile."""
+    thread_name: str
+    run_count: int
+    job_count: int
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+    worst_ms: float
+    run_to_run_spread_ms: float
+    exec_avg_ms: float
+    blocking_max_ms: float
+    preempted_max_ms: float
+    ipc_wait_max_ms: float
+    blocker_attribution: Dict[str, float] = field(default_factory=dict)
+
+
+def _pct(vals: List[float], q: float) -> float:
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    idx = min(len(s) - 1, int(round((q / 100.0) * (len(s) - 1))))
+    return s[idx]
+
+
+def summarize_profile(
+    sessions: Union[TraceSession, Sequence[TraceSession]],
+    thread_name: str,
+) -> RunProfile:
+    sess_list = [sessions] if isinstance(sessions, TraceSession) else list(sessions)
+    all_jobs = []
+    per_run_p99s = []
+    causes: Dict[str, float] = {}
+
+    for s in sess_list:
+        t_list = s.find_threads_by_name(thread_name)
+        r_jobs = [j for th in t_list for j in th.jobs]
+        if r_jobs:
+            per_run_p99s.append(_pct([j.response_time_ms for j in r_jobs], 99))
+            all_jobs.extend(r_jobs)
+            for j in r_jobs:
+                for k, v in j.blocker_attribution.items():
+                    causes[k] = max(causes.get(k, 0.0), v)
+
+    resps = [j.response_time_ms for j in all_jobs]
+    spread = (max(per_run_p99s) - min(per_run_p99s)) if len(per_run_p99s) >= 2 else 0.0
+    return RunProfile(
+        thread_name=thread_name,
+        run_count=len(sess_list),
+        job_count=len(all_jobs),
+        p50_ms=_pct(resps, 50),
+        p95_ms=_pct(resps, 95),
+        p99_ms=_pct(resps, 99),
+        worst_ms=max(resps) if resps else 0.0,
+        run_to_run_spread_ms=spread,
+        exec_avg_ms=(sum(j.exec_ms for j in all_jobs) / len(all_jobs)) if all_jobs else 0.0,
+        blocking_max_ms=max((j.mutex_blocked_ms + j.sem_blocked_ms + j.ipc_blocked_ms) for j in all_jobs) if all_jobs else 0.0,
+        preempted_max_ms=max(j.ready_preempted_ms for j in all_jobs) if all_jobs else 0.0,
+        ipc_wait_max_ms=max(j.ipc_blocked_ms for j in all_jobs) if all_jobs else 0.0,
+        blocker_attribution=causes,
+    )
 
 
 @dataclass
@@ -496,58 +783,52 @@ class RegressionReport:
     candidate_p99_ms: float
     ratio: float
     delta_ms: float
+    noise_floor_ms: float
     is_regression: bool
+    severity: str
     primary_new_blocker: str
     attribution_summary: str
 
 
 def compare_runs(
-    baseline: TraceSession,
-    candidate: TraceSession,
+    baseline: Union[TraceSession, Sequence[TraceSession]],
+    candidate: Union[TraceSession, Sequence[TraceSession]],
     thread_name: str,
     threshold_ratio: float = 1.25,
 ) -> RegressionReport:
-    b_threads = baseline.find_threads_by_name(thread_name)
-    c_threads = candidate.find_threads_by_name(thread_name)
+    """
+    Task 11: Compares baseline vs. candidate profiles using run-to-run variability
+    and attributes regressions to the exact new blocking mechanism.
+    """
+    b_prof = summarize_profile(baseline, thread_name)
+    c_prof = summarize_profile(candidate, thread_name)
 
-    b_jobs = [j for th in b_threads for j in th.jobs]
-    c_jobs = [j for th in c_threads for j in th.jobs]
-
-    def p99(vals: List[float]) -> float:
-        if not vals:
-            return 0.0
-        s = sorted(vals)
-        idx = min(len(s) - 1, int(len(s) * 0.99))
-        return s[idx]
-
-    b_p99 = p99([j.response_time_ms for j in b_jobs])
-    c_p99 = p99([j.response_time_ms for j in c_jobs])
+    b_p99 = b_prof.p99_ms
+    c_p99 = c_prof.p99_ms
     ratio = (c_p99 / b_p99) if b_p99 > 0 else (999.0 if c_p99 > 0 else 1.0)
     delta = c_p99 - b_p99
-
-    b_causes: Dict[str, float] = {}
-    for j in b_jobs:
-        for k, v in j.blocker_attribution.items():
-            b_causes[k] = max(b_causes.get(k, 0.0), v)
-
-    c_causes: Dict[str, float] = {}
-    for j in c_jobs:
-        for k, v in j.blocker_attribution.items():
-            c_causes[k] = max(c_causes.get(k, 0.0), v)
+    noise_floor = max(0.5, b_prof.run_to_run_spread_ms * 1.5, c_prof.run_to_run_spread_ms * 1.5)
 
     diffs: Dict[str, float] = {}
-    for k, c_val in c_causes.items():
-        diffs[k] = c_val - b_causes.get(k, 0.0)
+    for k, c_val in c_prof.blocker_attribution.items():
+        diffs[k] = c_val - b_prof.blocker_attribution.get(k, 0.0)
 
     if diffs:
         top_cause, top_diff = max(diffs.items(), key=lambda kv: kv[1])
     else:
         top_cause, top_diff = ("CPU execution/preemption", delta)
 
-    is_reg = ratio >= threshold_ratio and delta > 0.5
+    is_reg = (ratio >= threshold_ratio) and (delta > noise_floor)
+    if not is_reg:
+        severity = "NONE"
+    elif ratio >= 2.0 or delta >= 5.0:
+        severity = "CRITICAL"
+    else:
+        severity = "MODERATE"
+
     summary = (
-        f"Thread '{thread_name}' p99 response time changed from {b_p99:.3f} ms to {c_p99:.3f} ms "
-        f"({ratio:.2f}x, {delta:+.3f} ms). "
+        f"[{severity}] Thread '{thread_name}' p99 response time changed from {b_p99:.3f} ms "
+        f"to {c_p99:.3f} ms ({ratio:.2f}x, {delta:+.3f} ms; noise floor: ±{noise_floor:.3f} ms). "
         f"Primary attributed cause: {top_cause} ({top_diff:+.3f} ms)."
     )
     return RegressionReport(
@@ -556,7 +837,9 @@ def compare_runs(
         candidate_p99_ms=c_p99,
         ratio=ratio,
         delta_ms=delta,
+        noise_floor_ms=noise_floor,
         is_regression=is_reg,
+        severity=severity,
         primary_new_blocker=top_cause,
         attribution_summary=summary,
     )

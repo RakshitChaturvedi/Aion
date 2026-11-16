@@ -1,5 +1,4 @@
 import re
-import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -8,7 +7,11 @@ from aion.model import EvidenceRef, JobRun, StateInterval, ThreadTimeline
 def _unswap_qnx_usrstr(s: str) -> str:
     # fix qnx 8 x86_64 traceprinter byte-order on USRSTREVENT strings where middle 32-bit words
     # have adjacent chars swapped
-    return s.replace("sesnro", "sensor")
+    return (
+        s.replace("sesnro", "sensor")
+        .replace("cntorl", "control")
+        .replace("actuta", "actuat")
+        )
 
 @dataclass
 class UserMarker:
@@ -19,6 +22,17 @@ class UserMarker:
     cpu: int
     code: int
     payload: str
+
+@dataclass
+class SemPostEvent:
+    event_id: int
+    line_no: int
+    timestamp_cycles: int
+    timestamp_ms: float
+    cpu: int
+    sync_p: str
+    poster_key: Tuple[int, int]
+    poster_prio: int
 
 @dataclass
 class TraceSession:
@@ -32,6 +46,7 @@ class TraceSession:
     processes: Dict[int, str] = field(default_factory=dict)
     threads: Dict[Tuple[int, int], ThreadTimeline]  = field(default_factory=dict)
     markers: List[UserMarker] = field(default_factory=list)
+    sem_posts: List[SemPostEvent] = field(default_factory=list)
     malformed_lines: int = 0
 
     def cycles_to_ms(self, cycles: int) -> float:
@@ -150,6 +165,25 @@ def parse_traceprinter_file(filepath: str) -> TraceSession:
                 )
                 pending_sem_wait[runner_key] = (sync_p, ev_ref)
 
+        elif cls == "KER_CALL" and ev.startswith("SYNC_SEM_POST"):
+            sync_p = kv_block.get("sync_p")
+            runner_key = cpu_running.get(cpu)
+
+            if runner_key and sync_p:
+                r_th = get_thread(*runner_key)
+                session.sem_posts.append(
+                    SemPostEvent(
+                        event_id=ev_id,
+                        line_no=line_no,
+                        timestamp_cycles=t_cyc,
+                        timestamp_ms=t_ms,
+                        cpu=cpu,
+                        sync_p=sync_p,
+                        poster_key=runner_key,
+                        poster_prio=r_th.prio
+                    )
+                )
+
         current_event = None
         kv_block = {}
 
@@ -205,7 +239,6 @@ def parse_traceprinter_file(filepath: str) -> TraceSession:
                             th.policy = int(kvs["policy"])
 
                         if ev not in ("THCREATE", "THDESTROY"):
-                            # Close previous state interval if open
                             if key in open_state:
                                 prev = open_state[key]
                                 th.intervals.append(
@@ -229,7 +262,6 @@ def parse_traceprinter_file(filepath: str) -> TraceSession:
                                     )
                                 )
 
-                            # Open new state interval
                             new_state_info = {
                                 "state": ev,
                                 "start_cycles": t_cyc,
@@ -272,6 +304,17 @@ def parse_traceprinter_file(filepath: str) -> TraceSession:
                         )
                         pending_ipc_target[runner_key] = (srv_pid, None, ev_ref)
 
+                elif cls == "COMM" and ev == "REPLY_MESSAGE":
+                    kvs = dict(re.findall(r"(\w+):(\S+)", rest))
+                    client_pid = int(kvs["pid"]) if "pid" in kvs else None
+                    client_tid = int(kvs["tid"]) if "tid" in kvs else None
+                    runner_key = cpu_running.get(cpu)
+                    if client_pid and client_tid and runner_key:
+                        ckey = (client_pid, client_tid)
+                        if ckey in open_state and open_state[ckey].get("state") == "THREPLY":
+                            open_state[ckey]["ipc_server_pid"] = runner_key[0]
+                            open_state[ckey]["ipc_server_tid"] = runner_key[1]
+
                 elif cls == "USREVENT":
                     code_m = re.search(r"EVENT:(\d+)", ev)
                     str_m = re.search(r'STR:"([^"]*)"', rest)
@@ -297,8 +340,20 @@ def parse_traceprinter_file(filepath: str) -> TraceSession:
                     kv_block[k_m.group(1).strip()] = k_m.group(2).strip()
 
     flush_multiline()
+    _resolve_semaphore_posters(session)
     _extract_jobs(session)
     return session
+
+def _resolve_semaphore_posters(session: TraceSession) -> None:
+    """Links each THSEM interval to the thread that called SYNC_SEM_POST to wake it up."""
+    for th in session.threads.values():
+        for iv in th.intervals:
+            if iv.state != "THSEM" or not iv.sync_p:
+                continue
+            for sp in session.sem_posts:
+                if sp.sync_p == iv.sync_p and (iv.start_ms - 0.1) <= sp.timestamp_ms <= (iv.end_ms + 0.5):
+                    iv.owner_key = sp.poster_key
+                    break
 
 def _extract_jobs(session: TraceSession) -> None:
     """
@@ -345,7 +400,6 @@ def _extract_jobs(session: TraceSession) -> None:
                     )
                     in_job = False
 
-
 def _build_job_metrics(
     session: TraceSession,
     th: ThreadTimeline,
@@ -373,6 +427,11 @@ def _build_job_metrics(
             job.exec_ms += dur
         elif iv.state == "THREADY":
             job.ready_preempted_ms += dur
+            for runner_th, run_iv in session.cpu_runner_at(iv.cpu, ov_start, ov_end):
+                if (runner_th.pid, runner_th.tid) != (th.pid, th.tid):
+                    r_dur = min(ov_end, run_iv.end_ms) - max(ov_start, run_iv.start_ms)
+                    key = f"cpu_preempt:{runner_th.display_name}"
+                    job.blocker_attribution[key] = job.blocker_attribution.get(key, 0.0) + r_dur
         elif iv.state == "THMUTEX":
             job.mutex_blocked_ms += dur
             if iv.owner_key and iv.owner_key in session.threads:
@@ -381,10 +440,20 @@ def _build_job_metrics(
                 job.blocker_attribution[key] = job.blocker_attribution.get(key, 0.0) + dur
         elif iv.state == "THSEM":
             job.sem_blocked_ms += dur
+            if iv.owner_key and iv.owner_key in session.threads:
+                poster_th = session.threads[iv.owner_key]
+                key = f"semaphore:{poster_th.display_name}"
+            else:
+                key = f"semaphore:{iv.sync_p or 'unknown'}"
+            job.blocker_attribution[key] = job.blocker_attribution.get(key, 0.0) + dur
         elif iv.state == "THREPLY":
             job.ipc_blocked_ms += dur
-            srv_name = session.processes.get(iv.ipc_server_pid or 0, f"pid:{iv.ipc_server_pid}")
-            key = f"ipc:{srv_name}"
+            if iv.ipc_server_pid and iv.ipc_server_tid and (iv.ipc_server_pid, iv.ipc_server_tid) in session.threads:
+                srv_th = session.threads[(iv.ipc_server_pid, iv.ipc_server_tid)]
+                key = f"ipc:{srv_th.display_name}"
+            else:
+                srv_name = session.processes.get(iv.ipc_server_pid or 0, f"pid:{iv.ipc_server_pid}")
+                key = f"ipc:{srv_name}"
             job.blocker_attribution[key] = job.blocker_attribution.get(key, 0.0) + dur
         else:
             job.other_blocked_ms += dur

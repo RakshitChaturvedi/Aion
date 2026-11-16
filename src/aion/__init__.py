@@ -3,10 +3,12 @@ from aion.analyzers import (
     ConfigError,
     RegressionReport,
     RuleConfig,
+    RunProfile,
     TimingRule,
     analyze_session,
     compare_runs,
     load_config,
+    summarize_profile,
 )
 from aion.ingest import TraceSession, parse_traceprinter_file
 from aion.model import (
@@ -30,6 +32,7 @@ __all__ = [
     "JobRun",
     "RegressionReport",
     "RuleConfig",
+    "RunProfile",
     "StateInterval",
     "ThreadTimeline",
     "TimingRule",
@@ -38,4 +41,5 @@ __all__ = [
     "compare_runs",
     "load_config",
     "parse_traceprinter_file",
+    "summarize_profile",
 ]

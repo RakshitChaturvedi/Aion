@@ -1,0 +1,209 @@
+{
+  "verdict": "FAIL",
+  "trace": "traces/semaphore_demo.txt",
+  "cpus": 2,
+  "cycles_per_sec": 2496341575,
+  "threads_tracked": 120,
+  "markers": 4,
+  "metrics": [
+    {
+      "thread": "control_high",
+      "pid": 593936,
+      "tid": 4,
+      "prio": 40,
+      "inferred": false,
+      "jobs": 2,
+      "exec_avg_ms": 1.001,
+      "preempt_max_ms": 0.004,
+      "block_max_ms": 20.016,
+      "p50_ms": 1.003,
+      "p95_ms": 21.019,
+      "p99_ms": 21.019,
+      "max_ms": 21.019,
+      "jitter_ms": 20.016
+    }
+  ],
+  "findings_count": 2,
+  "findings": [
+    {
+      "finding_type": "deadline_miss",
+      "severity": "FAIL",
+      "rule_name": "control_high deadline",
+      "victim_thread": "control_high (semaphore_demo#4, prio:40)",
+      "summary": "Job #2 of control_high (semaphore_demo#4, prio:40) took 21.019 ms (deadline: 11.000 ms). Primary delay source: semaphore:diag_low (semaphore_demo#2, prio:10) (20.016 ms).",
+      "suggested_fix": "Inspect causal blockers (mutex/semaphore inversion, IPC wait, or CPU hog) during this job window.",
+      "confidence": "confirmed",
+      "start_ms": 1009.3918088913773,
+      "end_ms": 1030.4108098668348,
+      "duration_ms": 21.019000975457516,
+      "causal_chain": []
+    },
+    {
+      "finding_type": "priority_inversion_semaphore",
+      "severity": "FAIL",
+      "rule_name": "logical_checks.semaphore_locks",
+      "victim_thread": "control_high (semaphore_demo#4, prio:40)",
+      "summary": "Real-time thread control_high (semaphore_demo#4, prio:40) blocked in THSEM on 0x0000004726744010 for 20.016 ms waiting on lower-priority diag_low (semaphore_demo#2, prio:10) while proc_pool_thread (procnto-smp-instr#16, prio:25), crunch_med (semaphore_demo#3, prio:25), clock (0) (io-sock#15, prio:21), clock (1) (io-sock#16, prio:21), pf purge (io-sock#20, prio:21) preempted diag_low.",
+      "suggested_fix": "Replace shared-resource semaphore with a pthread_mutex_t configured with PTHREAD_PRIO_INHERIT.",
+      "confidence": "confirmed",
+      "start_ms": 1009.3923629021,
+      "end_ms": 1029.4079855638345,
+      "duration_ms": 20.015622661734483,
+      "causal_chain": [
+        {
+          "relation": "BLOCKED_ON_SEMAPHORE",
+          "victim_thread": "control_high (semaphore_demo#4, prio:40)",
+          "culprit_thread": "diag_low (semaphore_demo#2, prio:10)",
+          "mechanism": "semaphore 0x0000004726744010 (QNX semaphores have no priority inheritance)",
+          "duration_ms": 20.015622661734483,
+          "start_ms": 1009.3923629021,
+          "end_ms": 1029.4079855638345,
+          "confidence": "confirmed",
+          "evidence": [
+            {
+              "event_id": 6823,
+              "line_no": 17492,
+              "timestamp_cycles": 1461475375955,
+              "timestamp_ms": 1009.3923629021,
+              "cpu": 0,
+              "raw_event": "THREAD:THSEM",
+              "details": "pid:593936 tid:4 (control_high) prio:40 sync_p=0x0000004726744010"
+            }
+          ]
+        },
+        {
+          "relation": "PREEMPTED_BY_MEDIUM_THREAD",
+          "victim_thread": "diag_low (semaphore_demo#2, prio:10)",
+          "culprit_thread": "proc_pool_thread (procnto-smp-instr#16, prio:25)",
+          "mechanism": "strict priority preemption (prio 25 > poster prio 10)",
+          "duration_ms": 0.007140048532846777,
+          "start_ms": 1009.3923629021,
+          "end_ms": 1029.4079855638345,
+          "confidence": "confirmed",
+          "evidence": [
+            {
+              "event_id": 6914,
+              "line_no": 17723,
+              "timestamp_cycles": 1461525317521,
+              "timestamp_ms": 1029.3982653395499,
+              "cpu": 0,
+              "raw_event": "THREAD:THRUNNING",
+              "details": "pid:1 tid:16 (proc_pool_thread) prio:25 preempted diag_low"
+            }
+          ]
+        },
+        {
+          "relation": "PREEMPTED_BY_MEDIUM_THREAD",
+          "victim_thread": "diag_low (semaphore_demo#2, prio:10)",
+          "culprit_thread": "crunch_med (semaphore_demo#3, prio:25)",
+          "mechanism": "strict priority preemption (prio 25 > poster prio 10)",
+          "duration_ms": 19.994516575721264,
+          "start_ms": 1009.3923629021,
+          "end_ms": 1029.4079855638345,
+          "confidence": "confirmed",
+          "evidence": [
+            {
+              "event_id": 6824,
+              "line_no": 17493,
+              "timestamp_cycles": 1461475376215,
+              "timestamp_ms": 1009.3924670545135,
+              "cpu": 0,
+              "raw_event": "THREAD:THRUNNING",
+              "details": "pid:593936 tid:3 (crunch_med) prio:25 preempted diag_low"
+            },
+            {
+              "event_id": 6834,
+              "line_no": 17503,
+              "timestamp_cycles": 1461477871287,
+              "timestamp_ms": 1010.3919584802812,
+              "cpu": 0,
+              "raw_event": "THREAD:THRUNNING",
+              "details": "pid:593936 tid:3 (crunch_med) prio:25 preempted diag_low"
+            },
+            {
+              "event_id": 6863,
+              "line_no": 17560,
+              "timestamp_cycles": 1461515317196,
+              "timestamp_ms": 1025.3922730906727,
+              "cpu": 0,
+              "raw_event": "THREAD:THRUNNING",
+              "details": "pid:593936 tid:3 (crunch_med) prio:25 preempted diag_low"
+            },
+            {
+              "event_id": 6924,
+              "line_no": 17757,
+              "timestamp_cycles": 1461525335552,
+              "timestamp_ms": 1029.4054883094275,
+              "cpu": 0,
+              "raw_event": "THREAD:THRUNNING",
+              "details": "pid:593936 tid:3 (crunch_med) prio:25 preempted diag_low"
+            }
+          ]
+        },
+        {
+          "relation": "PREEMPTED_BY_MEDIUM_THREAD",
+          "victim_thread": "diag_low (semaphore_demo#2, prio:10)",
+          "culprit_thread": "clock (0) (io-sock#15, prio:21)",
+          "mechanism": "strict priority preemption (prio 21 > poster prio 10)",
+          "duration_ms": 0.013136423448145251,
+          "start_ms": 1009.3923629021,
+          "end_ms": 1029.4079855638345,
+          "confidence": "confirmed",
+          "evidence": [
+            {
+              "event_id": 6840,
+              "line_no": 17509,
+              "timestamp_cycles": 1461478128266,
+              "timestamp_ms": 1010.4949007228707,
+              "cpu": 1,
+              "raw_event": "THREAD:THRUNNING",
+              "details": "pid:163853 tid:15 (clock (0)) prio:21 preempted diag_low"
+            }
+          ]
+        },
+        {
+          "relation": "PREEMPTED_BY_MEDIUM_THREAD",
+          "victim_thread": "diag_low (semaphore_demo#2, prio:10)",
+          "culprit_thread": "clock (1) (io-sock#16, prio:21)",
+          "mechanism": "strict priority preemption (prio 21 > poster prio 10)",
+          "duration_ms": 0.02554618351859972,
+          "start_ms": 1009.3923629021,
+          "end_ms": 1029.4079855638345,
+          "confidence": "confirmed",
+          "evidence": [
+            {
+              "event_id": 6869,
+              "line_no": 17566,
+              "timestamp_cycles": 1461515359565,
+              "timestamp_ms": 1025.4092455276277,
+              "cpu": 1,
+              "raw_event": "THREAD:THRUNNING",
+              "details": "pid:163853 tid:16 (clock (1)) prio:21 preempted diag_low"
+            }
+          ]
+        },
+        {
+          "relation": "PREEMPTED_BY_MEDIUM_THREAD",
+          "victim_thread": "diag_low (semaphore_demo#2, prio:10)",
+          "culprit_thread": "pf purge (io-sock#20, prio:21)",
+          "mechanism": "strict priority preemption (prio 21 > poster prio 10)",
+          "duration_ms": 0.015896462406089995,
+          "start_ms": 1009.3923629021,
+          "end_ms": 1029.4079855638345,
+          "confidence": "confirmed",
+          "evidence": [
+            {
+              "event_id": 6882,
+              "line_no": 17614,
+              "timestamp_cycles": 1461515423700,
+              "timestamp_ms": 1025.434937123939,
+              "cpu": 1,
+              "raw_event": "THREAD:THRUNNING",
+              "details": "pid:163853 tid:20 (pf purge) prio:21 preempted diag_low"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

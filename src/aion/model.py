@@ -4,7 +4,7 @@
         with evidence links, and job/regression profiles.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -90,6 +90,14 @@ class CausalFinding:
         lines.append(f"    Suggested Fix: {self.suggested_fix}")
         return "\n".join(lines)
 
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["finding_type"] = self.finding_type.value
+        data["confidence"] = self.confidence.value
+        for edge in data["causal_chain"]:
+            edge["confidence"] = edge["confidence"].value if hasattr(edge["confidence"], "value") else str(edge["confidence"])
+        return data
+
 @dataclass
 class StateInterval:
     # contiguous time interval where thread remained in single state
@@ -155,3 +163,9 @@ class ThreadTimeline:
         t_label = self.name or f"tid-{self.tid}"
         p_label = self.process_name.split("/")[-1] if self.process_name else f"pid-{self.pid}"
         return f"{t_label} ({p_label}#{self.tid}, prio:{self.prio})"
+
+    def display_name_at(self, prio: Optional[int] = None) -> str:
+        t_label = self.name or f"tid-{self.tid}"
+        p_label = self.process_name.split("/")[-1] if self.process_name else f"pid-{self.pid}"
+        effective_prio = self.prio if prio is None else prio
+        return f"{t_label} ({p_label}#{self.tid}, prio:{effective_prio})"

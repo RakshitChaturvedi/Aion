@@ -50,3 +50,29 @@
   - `aion check` on `traces/inversion_fixed.txt` confirms `PTHREAD_PRIO_INHERIT` drops response time to 4.502 ms with 0 findings and exits `0`.
   - `aion diff` detects the 5.34x (+19.535 ms) p99 regression and attributes it to `mutex:logger_low (+23.032 ms)`.
   - All `pytest` unit and golden-file tests pass.
+
+
+## [2026-11-15] Phase 3 — Multi-Scenario Pathologies, Causal Hardening, & Zero False-Positive Verification
+
+### Summary
+Completed Phase 3 validation across all QNX 8.0 synthetic real-time fault-injection workloads (`semaphore_demo`, `cpu_hog_demo`, `ipc_msgsend_demo`), their remediated counterparts (`semaphore_fixed`, `cpu_hog_fixed`, `ipc_msgsend_fixed`), `aion diff` regression attribution, and the `negative_cases` false-positive control suite.
+
+### Changes Made
+- **Semaphore Poster Correlation (`aion/ingest.py`, `aion/analyzers.py`)**:
+  - Added `KER_CALL:SYNC_SEM_POST` parsing in `flush_multiline()` to populate `TraceSession.sem_posts` and resolve `StateInterval.owner_key` for `THSEM` intervals via `_resolve_semaphore_posters()`.
+  - Updated `_detect_semaphore_inversions()` to require a resolved lower-priority poster (`poster_th.prio < iv.prio`), upgrading `semaphore_demo.txt` findings to `confirmed` and eliminating false positives on top-down producer-consumer signaling in `negative_cases.txt` (`producer_high` prio 45 posting to `consumer_med` prio 30).
+- **Dynamic Preemptor Priority Attribution (`aion/model.py`, `aion/analyzers.py`)**:
+  - Added `ThreadTimeline.display_name_at(prio)` and updated `_find_medium_preemptors()` to key and format preempting threads using the instantaneous `run_iv.prio` from the `THRUNNING` event rather than end-of-trace `ThreadTimeline.prio`.
+  - Fixed `procnto-smp-instr` `proc_pool_thread` RCA labels across semaphore, IPC, and CPU hog detectors (`prio:25` and `prio:45` instead of stale `prio:10`).
+- **SCHED_LATENCY_MISS Edge Aggregation (`aion/analyzers.py`)**:
+  - Grouped `CPU_OCCUPIED_BY` interference intervals by `runner_th.display_name_at(run_iv.prio)` in `_check_timing_rule()` to merge consecutive preemption slices from the same thread into a single RCA step.
+
+### CLI Verification Matrix
+- `aion check --config samples/semaphore_rules.toml traces/semaphore_demo.txt` -> `FAIL` (2 findings: `DEADLINE_MISS` [21.019 ms], `PRIORITY_INVERSION_SEMAPHORE` [confirmed, 20.016 ms on `diag_low` preempted by `crunch_med`]).
+- `aion check --config samples/semaphore_rules.toml traces/semaphore_fixed.txt` -> `PASS` (0 findings; p99 = 4.028 ms).
+- `aion check --config samples/cpu_hog_rules.toml traces/cpu_hog_demo.txt` -> `FAIL` (1 finding: `SCHED_LATENCY_MISS` [confirmed, 17.067 ms in `THREADY` starved by `telemetry_hog` at prio 45]).
+- `aion check --config samples/cpu_hog_rules.toml traces/cpu_hog_fixed.txt` -> `PASS` (0 findings; max preempt = 0.012 ms).
+- `aion check --config samples/ipc_rules.toml traces/ipc_msgsend_demo.txt` -> `FAIL` (3 findings: `DEADLINE_MISS` [23.973 ms], `PRIORITY_INVERSION_IPC` [confirmed, 22.969 ms], `FORBIDDEN_BLOCKING_IPC` [confirmed, 22.969 ms]).
+- `aion check --config samples/ipc_rules.toml traces/ipc_msgsend_fixed.txt` -> `PASS` (0 findings; p99 = 1.006 ms, 0.000 ms block).
+- `aion diff traces/ipc_msgsend_fixed.txt traces/ipc_msgsend_demo.txt --thread sensor_high` -> `REGRESSION DETECTED (FAIL)` (`[CRITICAL]` 1.006 ms -> 23.973 ms, 23.84x, attributed to `ipc:diag_server` +22.969 ms).
+- `aion check --config samples/negative_rules.toml traces/negative_cases.txt` -> `PASS` (0 findings).
