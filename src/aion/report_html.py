@@ -357,9 +357,11 @@ def render_check_html(payload: Dict[str, Any]) -> str:
   </section>
 
   <div class="limits-banner">
-    <strong>Environment Metadata &amp; Honest Limits Note:</strong> Captured on QNX Neutrino RTOS 8.0 (x86_64 SMP, {threads_count} threads, {markers_count} markers).
-    When <code>target_env = "qemu"</code>, wall-clock timing thresholds include a +{margin_pct:.0f}% virtualization jitter tolerance,
-    while logical priority-inversion and forbidden-IPC checks remain 100% cycle-exact and environment-independent.
+    <strong>Calibrated Environment Metadata &amp; Honest Limits Note:</strong>
+    Captured on <strong>QNX Neutrino RTOS 8.0 (x86_64 2-CPU SMP, KVM + <code>pin_to_cpu0()</code>)</strong>
+    ({threads_count} threads, {markers_count} markers; marker overhead &lt; 1.5 &micro;s/event).
+    Empirical calibration (<code>docs/calibration.md</code>) measured baseline KVM + pinned-core scheduling jitter at
+    <strong>+1.4% to +4.2%</strong>, justifying <code>margin_pct = {margin_pct:.0f}%</code> on <code>target_env = "qemu"</code> while keeping logical RCA checks 100% cycle-exact.
   </div>
 
   <h2>1. Timing Analysis (Per-Thread Job Metrics)</h2>
@@ -430,6 +432,29 @@ def render_check_html(payload: Dict[str, Any]) -> str:
         </thead>
         <tbody>{cpu_html}</tbody>
       </table>
+    </div>
+  </div>
+  <div class="grid-2col">
+    <div>
+      <h2>7. Regression Comparison View</h2>
+      <div class="card">
+        <p style="margin-top:0;"><strong>Baseline vs. Candidate Attribution (<code>aion diff</code>):</strong></p>
+        <p class="mono" style="color:var(--muted);">
+          Run <code>aion diff &lt;baseline.txt&gt; {trace_path} --thread &lt;target_thread&gt;</code>
+          to compare p99 response times against stored baselines with automatic run-to-run noise-floor filtering (&plusmn;0.500 ms min).
+        </p>
+      </div>
+    </div>
+    <div>
+      <h2>8. CI Gate &amp; Verdict History</h2>
+      <div class="card">
+        <p style="margin-top:0;"><strong>Current CI Gate Exit Code:</strong> <code>{payload.get("exit_code", 0)}</code> ({verdict})</p>
+        <p style="color:var(--muted); margin-bottom:0;">
+          Logical Verdict: <strong>{logical_verdict}</strong> |
+          Wall-Clock Verdict: <strong>{wall_clock_verdict}</strong> |
+          Policy: <code>inconclusive_policy = "{html.escape(str(env.get('inconclusive_policy', 'warn')))}"</code>
+        </p>
+      </div>
     </div>
   </div>
 

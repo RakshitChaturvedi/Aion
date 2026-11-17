@@ -76,3 +76,21 @@ Completed Phase 3 validation across all QNX 8.0 synthetic real-time fault-inject
 - `aion check --config samples/ipc_rules.toml traces/ipc_msgsend_fixed.txt` -> `PASS` (0 findings; p99 = 1.006 ms, 0.000 ms block).
 - `aion diff traces/ipc_msgsend_fixed.txt traces/ipc_msgsend_demo.txt --thread sensor_high` -> `REGRESSION DETECTED (FAIL)` (`[CRITICAL]` 1.006 ms -> 23.973 ms, 23.84x, attributed to `ipc:diag_server` +22.969 ms).
 - `aion check --config samples/negative_rules.toml traces/negative_cases.txt` -> `PASS` (0 findings).
+
+## [2026-11-16] Phase 4 Complete (Tasks 1–11) — Interactive HTML Report, Three-Verdict Engine (Exit Code 4), Benchmark Harness, Calibration & Packaging
+
+### Summary
+Completed all 11 deliverables and passed all 4 Phase 4 gates from the project roadmap:
+1. Single-file interactive HTML report (`aion/report_html.py`) generated directly from the v1.0 JSON schema (`docs/json-schema.md`), featuring Overview, Timing Analysis, interactive Thread Explorer (timeline with clickable violation window highlighting), Root-Cause View, Recommendations, IPC View, CPU View, Regression View, CI History, Calibrated Environment Metadata, Honest-Limits Note, and the frozen "Profiler vs. Aion" differentiation footer.
+2. Three-verdict engine (`evaluate_verdicts()` in `aion/analyzers.py`) separating Logical Violations, Wall-Clock Violations, and Inconclusive Measurements with Exit Code `4` (`inconclusive_policy = "warn" | "fail"`).
+3. Full QNX target CI wrapper (`scripts/ci_qnx_target.sh`), pre-captured demo runner (`scripts/run_all_demos.sh`), and GitHub Actions workflow (`.github/workflows/aion-ci.yml`) documenting both hosted and self-hosted runners.
+4. Empirical calibration and marker overhead profiler (`scripts/calibrate_and_measure.py` -> `docs/calibration.md`) validating `margin_pct = 10` under QEMU/KVM + `pin_to_cpu0()` (+1.4% to +4.2% baseline jitter; < 1.5 µs per `TraceEvent` marker).
+5. Ground-truth benchmark harness (`scripts/benchmark.py`) across all 9 labelled QNX 8.0 traces achieving 100.0% Precision, 100.0% Recall, 0.0% False-Positive Rate, 100.0% Causal Attribution Accuracy, and 100.0% Reproducibility.
+6. Clean `pip install .` packaging (`pyproject.toml`) verified in a fresh virtual environment and `aion(1)` man-style CLI documentation added to `README.md`.
+
+### Verification Commands & Results
+- `./scripts/run_all_demos.sh` -> `8 passed, 0 failed`
+- `python3 scripts/benchmark.py` -> `Precision: 100.00%, Recall: 100.00%, FPR: 0.00%, Attribution: 100.00%, Reproducibility: 100.00%`
+- `python3 scripts/calibrate_and_measure.py` -> Generated `docs/calibration.md` (9 traces profiled)
+- `pytest -v` -> All unit, integration, JSON/HTML report, lateness, and exit code (`0, 1, 2, 3, 4`) tests passing
+- Clean venv install check (`/tmp/aion_fresh_venv/bin/pip install .`) -> `PASS` (exit code 0)

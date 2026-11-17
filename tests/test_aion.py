@@ -259,3 +259,14 @@ def test_cli_exit_code_1_on_inconclusive_fail_policy(tmp_path: Path):
         str(TRACES_DIR / "negative_cases.txt"),
     ])
     assert rc == 1
+
+def test_calibration_and_overhead_doc_generation():
+    from scripts.calibrate_and_measure import main as calibrate_main
+    rc = calibrate_main()
+    assert rc == 0
+    cal_doc = ROOT_DIR / "docs" / "calibration.md"
+    assert cal_doc.exists()
+    content = cal_doc.read_text(encoding="utf-8")
+    assert "margin_pct = 10" in content
+    assert "Task 8" in content
+    assert "Task 11" in content

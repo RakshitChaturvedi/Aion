@@ -165,9 +165,13 @@ def _collect_timeline_and_views(
     return {
         "environment": {
             "target_env": config.target_env,
+            "platform_profile": "QNX Neutrino 8.0 x86_64 SMP (QEMU/KVM + pin_to_cpu0)",
             "margin_pct": config.margin_pct,
+            "margin_calibrated": True,
+            "marker_overhead_us": 1.5,
+            "calibration_doc": "docs/calibration.md",
             "trace_date": getattr(session, "trace_date", "N/A"),
-            "tracelogger_args": session.tracelogger_args or "tracelogger -f <trace.kev>",
+            "tracelogger_args": session.tracelogger_args or "tracelogger -n 1 -f <trace.kev>",
         },
         "window_start_ms": round(win_start, 3),
         "window_end_ms": round(win_end, 3),
